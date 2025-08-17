@@ -6,7 +6,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.query_builder.functions import Abs, Sum
-from frappe.utils import flt, nowdate
+from frappe.utils import flt, get_link_to_form, nowdate
 
 import erpnext
 from erpnext.accounts.doctype.journal_entry.journal_entry import get_default_bank_cash_account
@@ -28,6 +28,7 @@ class EmployeeAdvance(Document):
 	def validate(self):
 		validate_active_employee(self.employee)
 		self.validate_exchange_rate()
+		self.validate_advance_account_type()
 		self.set_status()
 		self.set_pending_amount()
 
@@ -64,6 +65,15 @@ class EmployeeAdvance(Document):
 	def validate_exchange_rate(self):
 		if not self.exchange_rate:
 			frappe.throw(_("Exchange Rate cannot be zero."))
+
+	def validate_advance_account_type(self):
+		account_type = frappe.db.get_value("Account", self.advance_account, "account_type")
+		if account_type != "Receivable":
+			frappe.throw(
+				_("Employee advance account {0} should be of type {1}.").format(
+					get_link_to_form("Account", self.advance_account), frappe.bold("Receivable")
+				)
+			)
 
 	def set_status(self, update=False):
 		precision = self.precision("paid_amount")
@@ -106,6 +116,25 @@ class EmployeeAdvance(Document):
 	def set_total_advance_paid(self):
 		aple = frappe.qb.DocType("Advance Payment Ledger Entry")
 
+		account_type, account_curreny = frappe.get_value(
+			"Account", self.advance_account, ["account_type", "account_currency"]
+		)
+
+		company_currency = frappe.get_value("Company", self.company, "default_currency")
+
+		if account_type == "Receivable":
+			paid_amount_condition = aple.amount > 0
+			returned_amount_condition = aple.amount < 0
+		elif account_type == "Payable":
+			paid_amount_condition = aple.amount < 0
+			returned_amount_condition = aple.amount > 0
+		else:
+			frappe.throw(
+				_("Employee advance account {0} should be of type {1}").format(
+					frappe.bold(self.advance_account), frappe.bold("Receivable")
+				)
+			)
+
 		paid_amount = (
 			frappe.qb.from_(aple)
 			.select(Abs(Sum(aple.amount)).as_("paid_amount"))
@@ -114,24 +143,23 @@ class EmployeeAdvance(Document):
 				& (aple.delinked == 0)
 				& (aple.against_voucher_type == self.doctype)
 				& (aple.against_voucher_no == self.name)
-				& (aple.amount < 0)
+				& (paid_amount_condition)
 			)
 		).run(as_dict=True)[0].paid_amount or 0
 		return_amount = (
 			frappe.qb.from_(aple)
-			.select(Sum(aple.amount).as_("return_amount"))
+			.select(Abs(Sum(aple.amount)).as_("return_amount"))
 			.where(
 				(aple.company == self.company)
 				& (aple.delinked == 0)
 				& (aple.against_voucher_type == self.doctype)
 				& (aple.against_voucher_no == self.name)
-				& (aple.amount > 0)
+				& (returned_amount_condition)
 			)
 		).run(as_dict=True)[0].return_amount or 0
 
-		if paid_amount != 0:
+		if company_currency != self.currency and account_curreny == company_currency:
 			paid_amount = flt(paid_amount) / flt(self.exchange_rate)
-		if return_amount != 0:
 			return_amount = flt(return_amount) / flt(self.exchange_rate)
 
 		precision = self.precision("paid_amount")
